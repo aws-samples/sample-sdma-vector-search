@@ -1,0 +1,21 @@
+# Test-only dependencies. Lambda runtime dependencies live in
+# backend/lambda/functions/*/requirements.txt.
+#
+# Floors are set past known advisories; see the note in
+# backend/lambda/functions/ai-tag-generation/requirements.txt.
+pytest>=9.0.3
+
+# The tests import the function handlers, so this environment needs every
+# distribution those handlers import -- not just pytest. PyYAML and xxhash were
+# missing while correctly declared in the functions' own requirements, so a
+# machine that happened to have them showed a green suite while CI errored at
+# collection on one and failed four assertions on the other.
+#
+# botocore and urllib3 arrive with boto3, but they are declared here for the same
+# reason the functions declare them: relying on a transitive resolution hides the
+# floor, and urllib3's floor exists to clear an advisory.
+boto3>=1.43.64
+botocore>=1.43.64
+urllib3>=2.7.0
+PyYAML>=6.0
+xxhash>=3.4.0

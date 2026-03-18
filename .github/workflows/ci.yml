@@ -1,0 +1,107 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+name: CI
+
+# Actions are pinned to commit SHAs, not to `@v4`-style tags. A tag can be
+# silently repointed by whoever owns the action, so a mutable reference is a
+# supply-chain risk even for GitHub's own actions -- which is what ASH's semgrep
+# scanner reports on this file. The trailing comment records which release each
+# SHA was, and is the form Dependabot updates.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install test dependencies
+        run: pip install -r tests/requirements.txt
+
+      - name: Run tests
+        run: pytest
+
+  template:
+    name: Template validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install AWS SAM CLI
+        run: pip install aws-sam-cli
+
+      # --lint runs cfn-lint. The vector index carries resource-scoped
+      # suppressions for E3002/E3039, which are false positives from a
+      # published resource spec that does not yet describe VectorIndexes.
+      - name: Validate SAM template
+        run: sam validate -t infra/cloudformation/template.yaml --region us-east-1 --lint
+
+      - name: Validate Step Functions definition
+        run: python -c "import json; json.load(open('infra/stepfunctions/asset-processing-pipeline.asl.json'))"
+
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend/search-demo
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          # vite 8 requires ^20.19.0 || >=22.12.0
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/search-demo/package-lock.json
+
+      - run: npm ci
+
+      # Catches dependency advisories on pull requests. Dependabot only alerts
+      # on the default branch, so without this a PR can introduce a known-
+      # vulnerable dependency and only be flagged after merge.
+      - run: npm audit --audit-level=high
+
+      # Runs tsc as well as vite build, so type errors fail the build. Without
+      # this the demo is only ever exercised via `npm run dev`, which skips
+      # type checking.
+      - run: npm run build
+
+  scripts:
+    name: Shell script checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Syntax check
+        run: |
+          for f in scripts/*.sh scripts/lib/*.sh; do
+            bash -n "$f"
+          done
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          # Enforced at warning level. The scripts are clean at this level, and
+          # keeping the gate here is what catches unused variables left behind
+          # by a refactor -- exactly how a stale STACK_NAME survived one.
+          shellcheck -S warning scripts/*.sh scripts/lib/*.sh

@@ -1,0 +1,32 @@
+{
+  "connectorType": "lambda",
+  "direction": "publish",
+  "enabled": true,
+  "default": false,
+  "connectorConfig": {
+    "fieldMappings": [
+      {"source": "asset.assetId", "target": "assetId"},
+      {"source": "system:event", "target": "event"}
+    ],
+    "triggers": [
+      {
+        "description": "Start rendering on asset create",
+        "resources": ["asset"],
+        "events": ["uploadComplete", "create"],
+        "steps": [
+          {
+            "stepType": "lambdaInvoke",
+            "lambdaConfig": {
+              "functionArn": "${PREPARE_RENDER_ARN}",
+              "invocationType": "Event",
+              "region": "${AWS_REGION}"
+            },
+            "payload": {
+              "fields": ["assetId"]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

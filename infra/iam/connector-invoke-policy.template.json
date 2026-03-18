@@ -1,0 +1,15 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": ["${AI_TAG_ARN}", "${PREPARE_RENDER_ARN}"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "states:StartExecution",
+      "Resource": ["${SFN_ARN}"]
+    }
+  ]
+}

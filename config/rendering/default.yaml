@@ -1,0 +1,54 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+# Rendering Configuration - User Customizable Parameters
+version: "1.0"
+
+# View Selection
+# Available views: front, back, left, right, top, bottom, perspective_front, perspective_back
+views:
+  enabled:
+    - front
+    - back
+    - left
+    - right
+    - top
+    - bottom
+    - perspective_front
+    - perspective_back
+
+# Output Image Settings
+# Larger dimensions = better quality, slower render
+image:
+  width: 512
+  height: 512
+
+# Render Quality
+# Higher samples = better quality, longer render time
+quality:
+  samples: 32
+  use_denoising: true
+
+# Lighting Configuration
+# Adjust light positions and energy for better asset visibility
+lighting:
+  key_light:
+    location: [5, -3, 10]
+    energy: 5.0
+  fill_light:
+    location: [-5, 3, 5]
+    energy: 2.0
+  rim_light:
+    location: [0, 5, 8]
+    energy: 1.5
+  background:
+    color: [0.4, 0.4, 0.4, 1.0]
+    strength: 1.0
+
+# Camera Settings
+camera:
+  distance_factor: 3.0        # Multiplier for camera distance from object
+  ortho_padding_factor: 1.02  # Padding around object in orthographic views
+
+# Timeout Settings
+timeout:
+  render_seconds: 90  # Maximum render time per view

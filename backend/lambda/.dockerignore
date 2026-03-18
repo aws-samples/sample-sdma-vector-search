@@ -1,0 +1,13 @@
+# Docker build context for the Blender Lambda image.
+#
+# The context is this directory (backend/lambda/) so that the Dockerfile can
+# COPY shared/ directly. That would otherwise also ship the four zip functions,
+# so exclude everything and re-include only what the image needs.
+*
+!shared/
+!functions/blender-render/
+
+# Never ship caches or local build output, even from the included paths.
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/

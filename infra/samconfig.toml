@@ -1,0 +1,57 @@
+# SAM CLI configuration file
+# See https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-config.html
+
+version = 0.1
+
+[default.global.parameters]
+stack_name = "sdma-vector-search-extension"
+
+[default.build.parameters]
+template_file = "infra/cloudformation/template.yaml"
+cached = true
+parallel = true
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_NAMED_IAM"
+confirm_changeset = true
+resolve_s3 = true
+resolve_image_repos = true
+s3_prefix = "sdma-vector-search-extension"
+
+# Parameter overrides (customize per environment)
+# parameter_overrides = "Environment=dev SDMACognitoUserPoolArn=xxx SDMAAssetBucketName=xxx SDMAApiEndpoint=xxx SDMALibraryId=xxx"
+
+[default.sync.parameters]
+watch = true
+
+[default.local_start_api.parameters]
+warm_containers = "EAGER"
+
+[default.local_start_lambda.parameters]
+warm_containers = "EAGER"
+
+# ==============================================================================
+# Environment-specific configurations
+# ==============================================================================
+
+[dev]
+[dev.deploy.parameters]
+stack_name = "sdma-vector-search-extension-dev"
+s3_prefix = "sdma-vector-search-extension-dev"
+parameter_overrides = "Environment=dev"
+
+[staging]
+[staging.deploy.parameters]
+stack_name = "sdma-vector-search-extension-staging"
+s3_prefix = "sdma-vector-search-extension-staging"
+parameter_overrides = "Environment=staging"
+
+[prod]
+[prod.deploy.parameters]
+stack_name = "sdma-vector-search-extension-prod"
+s3_prefix = "sdma-vector-search-extension-prod"
+parameter_overrides = "Environment=prod"
+confirm_changeset = true

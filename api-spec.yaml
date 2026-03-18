@@ -1,0 +1,475 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+openapi: 3.0.3
+info:
+  title: SDMA Vector Search Extension API
+  description: |
+    AI-powered semantic search API for 3D assets in AWS Spatial Data Management (SDMA).
+
+    Uses DynamoDB native vector search with Titan Embed v2 for semantic similarity,
+    combined with metadata filtering for category-based discovery.
+  version: 1.0.0
+  contact:
+    name: SDMA Vector Search Extension
+  license:
+    name: MIT-0
+    url: https://opensource.org/licenses/MIT-0
+
+servers:
+  - url: https://{api-id}.execute-api.{region}.amazonaws.com/{stage}
+    description: API Gateway endpoint
+    variables:
+      api-id:
+        default: xxxxxxxxxx
+        description: API Gateway ID
+      region:
+        default: us-east-1
+        description: AWS Region
+      stage:
+        default: dev
+        description: Deployment stage
+
+security:
+  - CognitoAuth: []
+
+paths:
+  /assets/search:
+    post:
+      summary: Semantic asset search
+      description: |
+        Search for 3D assets using natural language queries with optional metadata filtering.
+        Results are ranked by cosine similarity using DynamoDB SearchVectors API.
+      operationId: searchAssets
+      tags:
+        - Search
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchRequest'
+            examples:
+              basicSearch:
+                summary: Basic text search
+                value:
+                  query: "wooden chair"
+                  limit: 10
+              filteredSearch:
+                summary: Search with filters
+                value:
+                  query: "modern furniture"
+                  filters:
+                    category: "Furniture"
+                    style: "Modern"
+                    materials: "Wood"
+                  limit: 20
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /assets/status:
+    get:
+      summary: Get asset processing status
+      description: |
+        Get the current processing status (rendering, AI tagging) for one or more assets.
+        Useful for monitoring upload progress.
+      operationId: getAssetsStatus
+      tags:
+        - Assets
+      parameters:
+        - name: ids
+          in: query
+          required: true
+          description: Comma-separated list of asset IDs (max 100)
+          schema:
+            type: string
+          example: "asset-123,asset-456"
+      responses:
+        '200':
+          description: Asset statuses
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /assets/{assetId}/extended-metadata:
+    get:
+      summary: Get AI-generated metadata
+      description: |
+        Get extended AI-generated metadata for a specific asset, including
+        tags, structured metadata (category, style, materials), and description.
+      operationId: getExtendedMetadata
+      tags:
+        - Assets
+      parameters:
+        - name: assetId
+          in: path
+          required: true
+          description: Asset ID
+          schema:
+            type: string
+          example: "asset-049ecd210be74e569738a133d8865833"
+      responses:
+        '200':
+          description: Extended metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExtendedMetadataResponse'
+        '400':
+          description: Asset not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /categories:
+    get:
+      summary: Get category configuration
+      description: |
+        Get the category configuration used for filtering. Returns available
+        categories, subcategories, styles, materials, and colors.
+      operationId: getCategories
+      tags:
+        - Configuration
+      responses:
+        '200':
+          description: Category configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CategoryConfig'
+        '401':
+          description: Unauthorized
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  securitySchemes:
+    CognitoAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Cognito User Pool JWT token. Obtain via:
+        ```
+        spatial-data-mgmt auth token
+        ```
+
+  schemas:
+    SearchRequest:
+      type: object
+      properties:
+        query:
+          type: string
+          description: >-
+            Natural language search query. Omit it (or send an empty string) to
+            browse instead of search: assets are listed, still honouring
+            `filters`, and results carry no `score` because there is nothing to
+            rank against.
+          maxLength: 1000
+          example: "wooden chair with armrests"
+        filters:
+          $ref: '#/components/schemas/SearchFilters'
+        limit:
+          type: integer
+          description: Number of results to return
+          default: 10
+          minimum: 1
+          maximum: 100
+
+    SearchFilters:
+      type: object
+      description: Optional filters to narrow search results
+      properties:
+        projectId:
+          type: string
+          description: >-
+            SDMA project ID. Narrows results to one project. Unlike the other
+            filters this is not one of the vector index's inline filter
+            attributes, so on a ranked search it is applied after retrieval —
+            which means a very large `limit` combined with this filter can still
+            return fewer results than requested.
+        category:
+          type: string
+          description: Main category (e.g., Furniture, Lighting, Decor)
+        subcategory:
+          type: string
+          description: Subcategory (e.g., Chair, Table, Floor Lamp)
+        style:
+          type: string
+          description: Visual style (e.g., Modern, Traditional, Minimalist)
+        materials:
+          type: string
+          description: Primary material (e.g., Wood, Metal, Fabric)
+        primaryColors:
+          type: string
+          description: Primary color (e.g., Brown, White, Black)
+        sizeCategory:
+          type: string
+          description: Size category. Values are lowercase — small, medium, large
+
+    SearchResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        query:
+          type: string
+          nullable: true
+          description: The query that was searched, or null in browse mode.
+          example: "wooden chair"
+        filters:
+          $ref: '#/components/schemas/SearchFilters'
+        mode:
+          type: string
+          description: >-
+            `semantic` when a query was supplied and results are ranked;
+            `browse` when it was omitted and results are an unranked listing.
+          enum: [semantic, browse]
+          example: semantic
+        resultCount:
+          type: integer
+          example: 5
+        results:
+          type: array
+          # Bounded by the same limit the handler enforces on the request, so a
+          # client can size its buffers from the contract rather than guessing.
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/SearchResult'
+
+    SearchResult:
+      type: object
+      properties:
+        assetId:
+          type: string
+          example: "asset-049ecd210be74e569738a133d8865833"
+        assetName:
+          type: string
+          example: "chair-modern-001"
+        score:
+          type: number
+          format: float
+          description: >-
+            Cosine similarity in 0-1, where higher means a closer match. Present
+            only for a ranked search; omitted entirely in browse mode (no
+            `query`), so clients must treat its absence as "not ranked" rather
+            than substituting zero.
+          example: 0.89
+        title:
+          type: string
+          example: "Modern Wooden Chair"
+        description:
+          type: string
+          example: "A contemporary wooden chair with clean lines..."
+        tags:
+          type: array
+          # config/tagging/default.yaml caps tag generation at max_tags, so the
+          # contract states the same bound rather than leaving it open-ended.
+          maxItems: 12
+          items:
+            type: string
+          example: ["chair", "wooden", "modern", "furniture"]
+        thumbnailUrl:
+          type: string
+          format: uri
+          description: Presigned S3 URL for thumbnail (1 hour expiry)
+        structuredMetadata:
+          $ref: '#/components/schemas/StructuredMetadata'
+
+    StructuredMetadata:
+      type: object
+      properties:
+        category:
+          type: string
+          example: "Furniture"
+        subcategory:
+          type: string
+          example: "Chair"
+        style:
+          type: string
+          example: "Modern"
+        materials:
+          type: array
+          # config/tagging/default.yaml lists 9 materials
+          maxItems: 9
+          items:
+            type: string
+          example: ["Wood", "Metal"]
+        primaryColors:
+          type: array
+          # config/tagging/default.yaml lists 13 colors
+          maxItems: 13
+          items:
+            type: string
+          example: ["Brown", "Black"]
+        sizeCategory:
+          type: string
+          example: "medium"
+
+    StatusResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        statuses:
+          type: array
+          # one entry per requested asset, bounded like a search page
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/AssetStatus'
+
+    AssetStatus:
+      type: object
+      properties:
+        assetId:
+          type: string
+          example: "asset-049ecd210be74e569738a133d8865833"
+        renderJobStatus:
+          type: string
+          enum: [PENDING, PROCESSING, RENDERING, COMPLETED, FAILED]
+          example: "COMPLETED"
+        aiTagJobStatus:
+          type: string
+          enum: [PENDING, PROCESSING, COMPLETED, FAILED]
+          example: "COMPLETED"
+        renderJobUpdatedAt:
+          type: string
+          format: date-time
+        aiTagJobUpdatedAt:
+          type: string
+          format: date-time
+
+    ExtendedMetadataResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        assetId:
+          type: string
+          example: "asset-049ecd210be74e569738a133d8865833"
+        tags:
+          type: array
+          # config/tagging/default.yaml caps tag generation at max_tags
+          maxItems: 12
+          items:
+            type: string
+          example: ["chair", "wooden", "modern"]
+        structuredMetadata:
+          $ref: '#/components/schemas/StructuredMetadata'
+        description:
+          type: string
+          example: "A contemporary wooden chair..."
+        vectorIndexed:
+          type: boolean
+          example: true
+        vectorIndexedAt:
+          type: string
+          format: date-time
+
+    CategoryConfig:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        categories:
+          type: object
+          description: >-
+            Category name to its subcategories. The tagging config nests each
+            category as `{description, subcategories}`; the endpoint flattens
+            that to the list, because the description is a prompt hint for the
+            model and not something a filter dropdown can use.
+          additionalProperties:
+            type: array
+            # the largest category in config/tagging/default.yaml has 9 subcategories
+            maxItems: 9
+            items:
+              type: string
+          example:
+            Furniture: [Chair, Table, Desk]
+            Lighting: [Floor Lamp, Table Lamp]
+        styles:
+          type: array
+          # config/tagging/default.yaml lists 8 styles
+          maxItems: 8
+          items:
+            type: string
+          example: ["Modern", "Traditional", "Minimalist"]
+        materials:
+          type: array
+          # config/tagging/default.yaml lists 9 materials
+          maxItems: 9
+          items:
+            type: string
+          example: ["Wood", "Metal", "Fabric"]
+        colors:
+          type: array
+          # config/tagging/default.yaml lists 13 colors
+          maxItems: 13
+          items:
+            type: string
+          example: ["Brown", "White", "Black"]
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "Missing required parameter: query"
+
+tags:
+  - name: Search
+    description: Semantic search operations
+  - name: Assets
+    description: Asset metadata and status
+  - name: Configuration
+    description: System configuration

@@ -1,0 +1,84 @@
+# AWS SAM
+.aws-sam/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+# Python build artifacts (not scripts/lib/)
+/lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+ENV/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn-integrity
+
+# Build outputs
+frontend/search-demo/dist/
+
+# IDE
+.idea/
+.vscode/
+.claude/
+# Agent workspace config. Kept local: the SDMA upgrade skill under
+# .kiro/skills/ records internal operational practice and is not for
+# publication in this repository.
+.kiro/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment files
+.env
+.env.local
+.env.*.local
+*.local.json
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Coverage
+coverage/
+.coverage
+htmlcov/
+
+# Test and security scan artifacts
+.pytest_cache/
+.ash/ash_output/
+
+# Omniverse Extension temp
+omniverse-extension/sdma/vector/search/__pycache__/
+
+# 3D assets are not distributed; users supply their own.
+# The directory README explains where to obtain them, so keep it tracked.
+asset-examples/*
+!asset-examples/README.md

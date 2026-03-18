@@ -1,0 +1,11 @@
+# AI Tag Generation Lambda Dependencies
+#
+# Floors are set to the lowest version free of known advisories, not to the
+# lowest version that merely works. Dependabot evaluates the whole range a
+# requirement permits, so a `>=` floor on a vulnerable release is reported as
+# vulnerable even when pip installs something newer.
+boto3>=1.34.0
+botocore>=1.34.0
+PyYAML>=6.0
+# Used by shared/sdma_client.py, which this function bundles to reach the SDMA API.
+urllib3>=2.7.0

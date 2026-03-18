@@ -1,0 +1,137 @@
+{
+  "Comment": "Asset Processing Pipeline - Render, AI Tag, and Vector Index (DynamoDB)",
+  "StartAt": "PrepareRender",
+  "States": {
+    "PrepareRender": {
+      "Type": "Task",
+      "Resource": "${PrepareRenderFunctionArn}",
+      "ResultPath": "$.prepareResult",
+      "Next": "RenderViews",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "MaxAttempts": 1,
+          "BackoffRate": 2,
+          "IntervalSeconds": 5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "TimeoutSeconds": 60
+    },
+    "RenderViews": {
+      "Type": "Map",
+      "ItemsPath": "$.prepareResult.renderJobs",
+      "MaxConcurrency": 8,
+      "ResultPath": "$.renderResults",
+      "Iterator": {
+        "StartAt": "BlenderRender",
+        "States": {
+          "BlenderRender": {
+            "Type": "Task",
+            "Resource": "${BlenderRenderFunctionArn}",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.TooManyRequestsException",
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException"
+                ],
+                "MaxAttempts": 4,
+                "BackoffRate": 2,
+                "IntervalSeconds": 5
+              },
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "MaxAttempts": 2,
+                "BackoffRate": 2,
+                "IntervalSeconds": 10
+              }
+            ],
+            "End": true,
+            "TimeoutSeconds": 150
+          }
+        }
+      },
+      "Next": "FinalizeRender",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ]
+    },
+    "FinalizeRender": {
+      "Type": "Task",
+      "Resource": "${FinalizeRenderFunctionArn}",
+      "Parameters": {
+        "prepareResult.$": "$.prepareResult",
+        "renderResults.$": "$.renderResults"
+      },
+      "ResultPath": "$.finalizeResult",
+      "Next": "GenerateAITags",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "TimeoutSeconds": 60
+    },
+    "GenerateAITags": {
+      "Type": "Task",
+      "Resource": "${AITagGenerationFunctionArn}",
+      "InputPath": "$.finalizeResult",
+      "ResultPath": "$.aiTagResult",
+      "Next": "PipelineSucceeded",
+      "Comment": "AI tagging generates the embedding and writes it to the DynamoDB vector table in the same step",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "MaxAttempts": 1,
+          "BackoffRate": 2,
+          "IntervalSeconds": 10
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "TimeoutSeconds": 360
+    },
+    "PipelineSucceeded": {
+      "Type": "Succeed"
+    },
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "PipelineError",
+      "Cause": "One or more steps in the asset processing pipeline failed"
+    }
+  },
+  "TimeoutSeconds": 1800
+}

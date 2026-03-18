@@ -1,0 +1,986 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: SDMA Vector Search Extension - AI Tag Generation and Semantic Search using DynamoDB native vector search
+
+# ==============================================================================
+# Parameters
+# ==============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+  BlenderImageTag:
+    Type: String
+    Default: latest
+    Description: >-
+      Tag of the blender-render container image to deploy. scripts/lib/build-image.sh
+      passes the image digest so the ImageUri changes whenever the image does.
+      A fixed tag such as "latest" leaves the ImageUri string identical between
+      deployments, so CloudFormation sees no change and the function keeps
+      running the previous image even though a new one was pushed -- code
+      changes then appear deployed when they are not.
+
+
+  SDMACognitoUserPoolArn:
+    Type: String
+    Description: Existing SDMA Cognito User Pool ARN for API Gateway authorization
+
+  SDMAAssetBucketName:
+    Type: String
+    Description: Existing SDMA S3 bucket name for assets
+
+
+
+
+  SDMAConnectorRoleArn:
+    Type: String
+    Default: ''
+    Description: SDMA ConnectorInvocation Role ARN (auto-discovered by deploy script)
+
+  SDMAApiEndpoint:
+    Type: String
+    Description: SDMA API Gateway endpoint URL (e.g., https://xxx.execute-api.region.amazonaws.com/stage)
+
+  SDMALibraryId:
+    Type: String
+    Description: >-
+      SDMA library the Extension operates on. Every SDMA API path is scoped to a
+      library and a deployment has exactly one, so it is resolved once at deploy
+      time rather than looked up on each invocation. scripts/deploy.sh discovers
+      it and fails if more than one exists.
+    AllowedPattern: '^library-[0-9a-f]{32}$'
+    ConstraintDescription: must be an SDMA library id, e.g. library-0123456789abcdef0123456789abcdef
+
+  AIModelId:
+    Type: String
+    Default: global.anthropic.claude-haiku-4-5-20251001-v1:0
+    Description: Bedrock model ID for AI tag generation (e.g., global.anthropic.claude-haiku-4-5-20251001-v1:0)
+
+  EmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+    Description: >-
+      Bedrock model ID used to generate embeddings. Must match EmbeddingDimensions.
+      Changing this requires re-indexing every asset, because query and stored
+      vectors must come from the same model.
+
+  EmbeddingDimensions:
+    Type: Number
+    Default: 1024
+    MinValue: 1
+    MaxValue: 4096
+    Description: >-
+      Embedding vector dimensions. Must match the output of EmbeddingModelId
+      (Titan Embed v2 = 1024). Changing this replaces the vector table.
+
+  VectorIndexName:
+    Type: String
+    Default: embedding-index
+    MinLength: 3
+    MaxLength: 255
+    Description: Name of the DynamoDB vector index on the asset vector table
+
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: CloudWatch Logs retention for the Lambda log groups
+
+# ==============================================================================
+# Globals
+# ==============================================================================
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        AWS_REGION_NAME: !Ref AWS::Region
+  Api:
+    Cors:
+      AllowMethods: "'GET,POST,OPTIONS'"
+      AllowHeaders: "'Content-Type,Authorization'"
+      AllowOrigin: "'*'"
+
+# ==============================================================================
+# Conditions
+# ==============================================================================
+Conditions:
+  HasSDMAConnectorRole: !Not [!Equals [!Ref SDMAConnectorRoleArn, '']]
+
+# ==============================================================================
+# Resources
+# ==============================================================================
+Resources:
+
+  # This avoids CloudFormation conflicts with existing resources.
+
+  # ============================================================================
+  # DynamoDB
+  # ============================================================================
+  # Vector search table. Embeddings are stored on the base table and replicated
+  # into a native vector index, queried via the SearchVectors API.
+  # Dimensions must match the embedding model (Titan Embed v2 = 1024).
+  # Storage this stack owns, for the Extension's own data.
+  #
+  # The rendering and tagging configs, and the intermediate ai_metadata.json,
+  # used to be written into SDMA's asset bucket under config/ and assets/.
+  # That put this solution's data in a bucket it does not own and claimed
+  # prefixes in SDMA's namespace, where a future SDMA release could collide with
+  # them, and left them behind if teardown missed them.
+  #
+  # SDMA's bucket is still read for asset content, using keys SDMA's API hands
+  # back (objectKey, manifestObjectKey), and still written through the
+  # short-lived credentials SDMA vends. Only the Extension's own data moves here.
+  ExtensionDataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-data-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          # Per-asset intermediates are consumed within one pipeline run; the
+          # configs live under config/ and are excluded from this rule.
+          - Id: ExpireAssetIntermediates
+            Status: Enabled
+            Prefix: assets/
+            ExpirationInDays: 7
+            NoncurrentVersionExpirationInDays: 1
+
+  # Processing state for each asset, owned by this stack.
+  #
+  # These attributes used to be written onto SDMA's own asset record. That put
+  # Extension-specific fields (renderJobStatus, aiTagJobStatus, currentRenderId,
+  # lastRenderId, and a lowercase updatedAt duplicating SDMA's UpdatedAt) into a
+  # table this solution does not own, where they could collide with whatever
+  # SDMA adds later and left no trace in SDMA's own UpdatedBy audit field.
+  #
+  # Kept separate from AssetVectorTable because the lifecycles differ: status is
+  # written when processing starts, whereas the vector item only exists once it
+  # finishes. Sharing one table would put rows in the vector index with no
+  # embedding and no SearchSchema attributes, and such rows are silently
+  # excluded from search results -- the failure mode hardest to notice.
+  AssetJobsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${AWS::StackName}-AssetJobs'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: assetId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: assetId
+          KeyType: HASH
+      # Processing state is only useful while a pipeline runs or shortly after,
+      # so it expires rather than accumulating one row per asset forever.
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  AssetVectorTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            # False positives from a stale bundled resource spec. CloudFormation
+            # supports VectorIndexes (verified by deploying this template), but
+            # the published spec has not caught up yet.
+            #   E3002 - "VectorIndexes was unexpected"
+            #   E3039 - AttributeDefinitions/KeySchema mismatch; the extra
+            #           attributes are referenced by the vector index
+            #           SearchSchema, which the spec does not model.
+            # Remove these once the spec includes VectorIndexes.
+            - E3002
+            - E3039
+    Properties:
+      TableName: !Sub '${AWS::StackName}-AssetVectors'
+      # Vector indexes require on-demand capacity mode.
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: assetId
+          AttributeType: S
+        # Referenced by the vector index SearchSchema, so declared here the same
+        # way key attributes are declared for a global secondary index.
+        - AttributeName: category
+          AttributeType: S
+        - AttributeName: style
+          AttributeType: S
+        - AttributeName: primaryMaterial
+          AttributeType: S
+        - AttributeName: primaryColor
+          AttributeType: S
+      KeySchema:
+        - AttributeName: assetId
+          KeyType: HASH
+      VectorIndexes:
+        - IndexName: !Ref VectorIndexName
+          VectorAttribute:
+            AttributeName: embedding
+          Dimensions: !Ref EmbeddingDimensions
+          DistanceFunction: COSINE
+          # INLINE_FILTER attributes support equality filtering at the storage
+          # layer via SearchConditionExpression.
+          SearchSchema:
+            - AttributeName: category
+              SearchSchemaElementType: INLINE_FILTER
+            - AttributeName: style
+              SearchSchemaElementType: INLINE_FILTER
+            - AttributeName: primaryMaterial
+              SearchSchemaElementType: INLINE_FILTER
+            - AttributeName: primaryColor
+              SearchSchemaElementType: INLINE_FILTER
+          Projection:
+            ProjectionType: ALL
+
+  # ============================================================================
+  # IAM Roles
+  # ============================================================================
+  AITagGenerationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ai-tag-generation-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  # Inference profiles (required for newer models)
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+                  # Foundation models
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+                  - 'arn:aws:bedrock:*::foundation-model/*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read only, and only as a fallback: rendered views are normally
+              # fetched through the presigned URLs SDMA issues. Nothing writes to
+              # SDMA's bucket from here any more -- the Extension's own configs
+              # and intermediates live in ExtensionDataBucket.
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${SDMAAssetBucketName}/*'
+        - PolicyName: ExtensionDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ExtensionDataBucket.Arn
+                  - !Sub '${ExtensionDataBucket.Arn}/*'
+        # Covers both of this stack's tables: the vector item this function
+        # writes, and the advisory processing state.
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt AssetJobsTable.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:GetItem
+                Resource:
+                  - !GetAtt AssetVectorTable.Arn
+        - PolicyName: SDMAApiAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - execute-api:Invoke
+                Resource:
+                  # Read only: this function reads the asset name and presigns
+                  # the rendered views. Writing the asset record was dropped when
+                  # processing state moved to this stack's own table.
+                  - !Sub 'arn:aws:execute-api:${AWS::Region}:*:*/*/GET/iam/*'
+
+  VectorSearchApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'vector-search-api-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBVectorSearch
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:SearchVectors
+                  - dynamodb:GetItem
+                  # Browse mode lists assets without a query, so it cannot use
+                  # the vector index and scans the table instead.
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt AssetVectorTable.Arn
+                  - !Sub '${AssetVectorTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  # Only the embedding model is invoked from the search path.
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}'
+        - PolicyName: AssetJobsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt AssetJobsTable.Arn
+        - PolicyName: ExtensionDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read only: this function reads a config from the bucket and
+              # writes nothing to it.
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub '${ExtensionDataBucket.Arn}/*'
+        - PolicyName: SDMAApiAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - execute-api:Invoke
+                Resource:
+                  - !Sub 'arn:aws:execute-api:${AWS::Region}:*:*/*/GET/iam/*'
+
+  # ============================================================================
+  # Lambda Functions
+  # ============================================================================
+  AITagGenerationFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub 'ai-tag-generation-${Environment}'
+      LoggingConfig:
+        LogGroup: !Ref AITagGenerationLogGroup
+      Runtime: python3.11
+      Architectures:
+        - x86_64
+      CodeUri: ../../backend/lambda/
+      Handler: handler.lambda_handler
+      Role: !GetAtt AITagGenerationFunctionRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 50
+      Environment:
+        Variables:
+          AI_MODEL: !Ref AIModelId
+          S3_BUCKET_NAME: !Ref SDMAAssetBucketName
+          VECTOR_TABLE_NAME: !Ref AssetVectorTable
+          EMBEDDING_MODEL_ID: !Ref EmbeddingModelId
+          EMBEDDING_DIMENSIONS: !Ref EmbeddingDimensions
+          SDMA_API_ENDPOINT: !Ref SDMAApiEndpoint
+          SDMA_LIBRARY_ID: !Ref SDMALibraryId
+          ASSET_JOBS_TABLE: !Ref AssetJobsTable
+          EXTENSION_BUCKET: !Ref ExtensionDataBucket
+
+  VectorSearchApiFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub 'vector-search-api-${Environment}'
+      LoggingConfig:
+        LogGroup: !Ref VectorSearchApiLogGroup
+      Runtime: python3.11
+      Architectures:
+        - arm64
+      CodeUri: ../../backend/lambda/
+      Handler: handler.lambda_handler
+      Role: !GetAtt VectorSearchApiFunctionRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      # Reserved concurrency bounds the blast radius of a runaway invocation --
+      # in cost, and in throttling everything else the account shares.
+      ReservedConcurrentExecutions: 20
+      Environment:
+        Variables:
+          SDMA_API_ENDPOINT: !Ref SDMAApiEndpoint
+          SDMA_LIBRARY_ID: !Ref SDMALibraryId
+          ASSET_JOBS_TABLE: !Ref AssetJobsTable
+          EXTENSION_BUCKET: !Ref ExtensionDataBucket
+          VECTOR_TABLE_NAME: !Ref AssetVectorTable
+          VECTOR_INDEX_NAME: !Ref VectorIndexName
+          EMBEDDING_MODEL_ID: !Ref EmbeddingModelId
+          EMBEDDING_DIMENSIONS: !Ref EmbeddingDimensions
+      Events:
+        SearchAssets:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AIAssetSearchApi
+            Path: /assets/search
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        GetAssetsStatus:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AIAssetSearchApi
+            Path: /assets/status
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+        GetExtendedMetadata:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AIAssetSearchApi
+            Path: /assets/{assetId}/extended-metadata
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+        GetCategories:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AIAssetSearchApi
+            Path: /categories
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Lambda-based Blender Rendering (replaces Deadline Cloud for faster processing)
+  # ============================================================================
+
+  # NOTE: ECR Repository 'sdma-blender-render-${Environment}' is created manually
+  # using scripts/build-blender-image.sh. This allows faster iteration on the
+  # container image without requiring CloudFormation updates.
+
+  # IAM Role for Blender Render Lambda
+  BlenderRenderFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'blender-render-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read only, and only as a fallback: the model is normally fetched
+              # through the presigned URL prepare-render obtains from SDMA, which
+              # goes through SDMA's access control. Renders are written with the
+              # short-lived credentials SDMA vends, not with this role, so no
+              # PutObject is needed here.
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${SDMAAssetBucketName}/*'
+        - PolicyName: KMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The SDMA bucket may use SSE-KMS. The key is owned by SDMA and its
+              # ARN is not known here, so restrict use to S3 on this account's
+              # behalf rather than granting unconditional key access.
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 's3.${AWS::Region}.amazonaws.com'
+
+  # Blender Render Lambda (Container Image)
+  # Renders a single view of a 3D model using Blender Cycles
+  # NOTE: Image is pre-built and pushed to ECR using scripts/build-blender-image.sh
+  BlenderRenderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'blender-render-${Environment}'
+      LoggingConfig:
+        LogGroup: !Ref BlenderRenderLogGroup
+      PackageType: Image
+      ImageUri: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/sdma-blender-render-${Environment}:${BlenderImageTag}'
+      Role: !GetAtt BlenderRenderFunctionRole.Arn
+      MemorySize: 4096
+      # Deliberately no ReservedConcurrentExecutions. This function's concurrency
+      # is set by how many assets are being processed at once, which is
+      # unbounded by design -- the connector starts one pipeline per upload, and
+      # each fans out to eight views. Reserving a limit converts that into
+      # throttling: at 100, a 140-asset upload produced 2599 throttles and
+      # exhausted the retry on 8 pipelines, where the same upload had zero
+      # failures with no limit. Measured, not assumed.
+      Timeout: 120
+      Architectures:
+        - x86_64
+      # No environment variables: every input arrives in the Step Functions
+      # payload -- the bucket, the presigned model URL, the render config, and
+      # the credentials SDMA vends for the upload.
+
+  # ============================================================================
+  # Step Functions - Asset Processing Pipeline
+  # ============================================================================
+
+  # IAM Role for Prepare Render Lambda
+  PrepareRenderFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'prepare-render-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ExtensionDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read only: this function reads a config from the bucket and
+              # writes nothing to it.
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub '${ExtensionDataBucket.Arn}/*'
+        - PolicyName: AssetJobsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt AssetJobsTable.Arn
+        - PolicyName: StepFunctionsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  - !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:asset-processing-pipeline-${Environment}'
+        - PolicyName: SDMAApiAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - execute-api:Invoke
+                Resource:
+                  - !Sub 'arn:aws:execute-api:${AWS::Region}:*:*/*/GET/iam/*'
+
+  PrepareRenderFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub 'prepare-render-${Environment}'
+      LoggingConfig:
+        LogGroup: !Ref PrepareRenderLogGroup
+      Runtime: python3.11
+      Architectures:
+        - arm64
+      CodeUri: ../../backend/lambda/
+      Handler: handler.lambda_handler
+      Role: !GetAtt PrepareRenderFunctionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      # One invocation per uploaded asset, so UPLOAD_PARALLEL=10 is the floor.
+      # Doubled to leave room for retries and a second concurrent uploader.
+      ReservedConcurrentExecutions: 20
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref SDMAAssetBucketName
+          SDMA_API_ENDPOINT: !Ref SDMAApiEndpoint
+          SDMA_LIBRARY_ID: !Ref SDMALibraryId
+          ASSET_JOBS_TABLE: !Ref AssetJobsTable
+          EXTENSION_BUCKET: !Ref ExtensionDataBucket
+          STATE_MACHINE_ARN: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:asset-processing-pipeline-${Environment}'
+  FinalizeRenderFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'finalize-render-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The manifest only, and read only. It is asset metadata rather
+              # than a registered file, so GetFile cannot address it. The write
+              # goes through the short-lived credentials SDMA vends, not this
+              # role, so no PutObject is needed here.
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${SDMAAssetBucketName}/*'
+        - PolicyName: AssetJobsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt AssetJobsTable.Arn
+        - PolicyName: SDMAApiAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - execute-api:Invoke
+                Resource:
+                  # GET reads the asset record for its manifest key and library,
+                  # which used to come from a direct read of SDMA's table.
+                  - !Sub 'arn:aws:execute-api:${AWS::Region}:*:*/*/GET/iam/*'
+                  - !Sub 'arn:aws:execute-api:${AWS::Region}:*:*/*/PUT/iam/*'
+
+  FinalizeRenderFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub 'finalize-render-${Environment}'
+      LoggingConfig:
+        LogGroup: !Ref FinalizeRenderLogGroup
+      Runtime: python3.11
+      Architectures:
+        - arm64
+      CodeUri: ../../backend/lambda/
+      Handler: handler.lambda_handler
+      Role: !GetAtt FinalizeRenderFunctionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      # One invocation per uploaded asset, so UPLOAD_PARALLEL=10 is the floor.
+      # Doubled to leave room for retries and a second concurrent uploader.
+      ReservedConcurrentExecutions: 20
+      Environment:
+        Variables:
+          SDMA_API_ENDPOINT: !Ref SDMAApiEndpoint
+          SDMA_LIBRARY_ID: !Ref SDMALibraryId
+          ASSET_JOBS_TABLE: !Ref AssetJobsTable
+
+  # Step Functions State Machine
+  AssetProcessingStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'asset-processing-sfn-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdas
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt PrepareRenderFunction.Arn
+                  - !GetAtt BlenderRenderFunction.Arn
+                  - !GetAtt FinalizeRenderFunction.Arn
+                  - !GetAtt AITagGenerationFunction.Arn
+
+  AssetProcessingStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub 'asset-processing-pipeline-${Environment}'
+      DefinitionUri: ../stepfunctions/asset-processing-pipeline.asl.json
+      DefinitionSubstitutions:
+        PrepareRenderFunctionArn: !GetAtt PrepareRenderFunction.Arn
+        BlenderRenderFunctionArn: !GetAtt BlenderRenderFunction.Arn
+        FinalizeRenderFunctionArn: !GetAtt FinalizeRenderFunction.Arn
+        AITagGenerationFunctionArn: !GetAtt AITagGenerationFunction.Arn
+      Role: !GetAtt AssetProcessingStateMachineRole.Arn
+
+  # Permission for SDMA Connector to start Step Functions execution
+  SDMAInvokeStateMachinePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasSDMAConnectorRole
+    Properties:
+      FunctionName: !Ref PrepareRenderFunction
+      Action: lambda:InvokeFunction
+      Principal: !Ref SDMAConnectorRoleArn
+      SourceAccount: !Ref AWS::AccountId
+
+  # ============================================================================
+  # API Gateway
+  # ============================================================================
+  AIAssetSearchApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub 'ai-asset-search-api-${Environment}'
+      StageName: !Ref Environment
+      Description: AI Asset Search API with DynamoDB native vector search
+      TracingEnabled: true
+      AccessLogSetting:
+        # API Gateway expects arn:...:log-group:<name> and stores it without the
+        # trailing ":*" that !GetAtt Arn returns, which CloudFormation then
+        # reports as drift. Build the ARN in the form API Gateway keeps.
+        DestinationArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ApiAccessLogGroup}'
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","path":"$context.path","status":"$context.status","responseLength":"$context.responseLength"}'
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !Ref SDMACognitoUserPoolArn
+      GatewayResponses:
+        UNAUTHORIZED:
+          StatusCode: 401
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+          ResponseTemplates:
+            application/json: '{"message": "Unauthorized"}'
+        ACCESS_DENIED:
+          StatusCode: 403
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+          ResponseTemplates:
+            application/json: '{"message": "Access Denied"}'
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+
+  # API Gateway Access Log Group
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/ai-asset-search-api-${Environment}'
+      # Same parameter as the function log groups. Hardcoding 30 here meant the
+      # two agreed only while the parameter kept its default.
+      RetentionInDays: !Ref LogRetentionInDays
+
+  # Lambda log groups are declared explicitly so that retention is bounded.
+  # Without them, Lambda auto-creates /aws/lambda/<function> with unlimited
+  # retention. The names below intentionally differ from the auto-created ones
+  # so that declaring them cannot collide with log groups that already exist.
+  AITagGenerationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/sdma-vector-search/ai-tag-generation-${Environment}'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  VectorSearchApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/sdma-vector-search/vector-search-api-${Environment}'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  BlenderRenderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/sdma-vector-search/blender-render-${Environment}'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  PrepareRenderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/sdma-vector-search/prepare-render-${Environment}'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  FinalizeRenderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/sdma-vector-search/finalize-render-${Environment}'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  # Permission for SDMA ConnectorInvocationFunction to invoke AI Tag Generation Lambda
+  SDMAInvokeAITagGenerationPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasSDMAConnectorRole
+    Properties:
+      FunctionName: !Ref AITagGenerationFunction
+      Action: lambda:InvokeFunction
+      Principal: !Ref SDMAConnectorRoleArn
+      SourceAccount: !Ref AWS::AccountId
+
+# ==============================================================================
+# Outputs
+# ==============================================================================
+Outputs:
+
+  ExtensionDataBucketName:
+    Description: >-
+      Bucket this stack owns for the Extension's own data (rendering and tagging
+      configs, per-asset intermediates). Read by scripts/lib/upload-*-config.sh
+      so they no longer write into SDMA's asset bucket.
+    Value: !Ref ExtensionDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ExtensionDataBucket'
+
+
+  AITagGenerationFunctionArn:
+    Description: AI Tag Generation Lambda Function ARN
+    Value: !GetAtt AITagGenerationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AITagGenerationArn'
+
+  VectorSearchApiFunctionArn:
+    Description: Vector Search API Lambda Function ARN
+    Value: !GetAtt VectorSearchApiFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-VectorSearchApiArn'
+
+  APIGatewayEndpoint:
+    Description: AI Asset Search API Gateway Endpoint
+    Value: !Sub 'https://${AIAssetSearchApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-APIEndpoint'
+
+  SDMAAssetBucketName:
+    Description: S3 Bucket for SDMA assets
+    Value: !Ref SDMAAssetBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-SDMAAssetBucket'
+
+
+
+
+  BlenderRenderRepositoryUri:
+    Description: ECR Repository URI for Blender render container
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/sdma-blender-render-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-BlenderRenderRepoUri'
+
+  BlenderRenderFunctionArn:
+    Description: Blender Render Lambda Function ARN
+    Value: !GetAtt BlenderRenderFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BlenderRenderArn'
+
+  AssetProcessingStateMachineArn:
+    Description: Asset Processing Pipeline State Machine ARN
+    Value: !GetAtt AssetProcessingStateMachine.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineArn'
+
+  PrepareRenderFunctionArn:
+    Description: Prepare Render Lambda Function ARN
+    Value: !GetAtt PrepareRenderFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PrepareRenderArn'
+
+  FinalizeRenderFunctionArn:
+    Description: Finalize Render Lambda Function ARN
+    Value: !GetAtt FinalizeRenderFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FinalizeRenderArn'
+
+  VectorTableName:
+    Description: DynamoDB Vector search table name
+    Value: !Ref AssetVectorTable
+    Export:
+      Name: !Sub '${AWS::StackName}-VectorTableName'
+
+  VectorTableArn:
+    Description: DynamoDB Vector search table ARN
+    Value: !GetAtt AssetVectorTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-VectorTableArn'

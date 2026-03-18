@@ -1,0 +1,9 @@
+# Vector Search API Lambda Dependencies
+# boto3 1.43.64 is the first release exposing SearchVectors.
+boto3>=1.43.64
+botocore>=1.43.64
+# Used by handler.py to fetch SDMA thumbnails.
+urllib3>=2.7.0
+# Used by handler.py to read the tagging config that supplies the UI's filter
+# vocabularies.
+PyYAML>=6.0

@@ -1,0 +1,6 @@
+# Finalize Render Lambda Dependencies
+boto3>=1.34.0
+botocore>=1.34.0
+xxhash>=3.4.0
+# Used by handler.py to call the SDMA API.
+urllib3>=2.7.0

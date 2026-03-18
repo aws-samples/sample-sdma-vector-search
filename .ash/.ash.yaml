@@ -1,0 +1,115 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/awslabs/automated-security-helper/refs/heads/main/automated_security_helper/schemas/AshConfig.json
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Configuration for ASH, the Automated Security Helper
+# (https://github.com/awslabs/automated-security-helper). Run a scan with:
+#
+#   ash --mode local
+#
+# The filename matters: ASH reads `.ash/.ash.yaml`, `.ash/.ash.yml` or
+# `.ash.yml`. A file named `.ash/ash.yaml` is silently ignored, and the scan
+# then runs with defaults as though no configuration existed.
+#
+# A directory also needs a '/**' suffix. Without it validation rejects the
+# config outright rather than matching only the directory entry.
+project_name: sdma-vector-search-extension
+
+global_settings:
+  severity_threshold: MEDIUM
+
+  # Build output and local caches, not source of this project. Scanning them
+  # reports findings in vendored third-party code that cannot be fixed here:
+  # every one of the 28 bandit findings from an unfiltered scan was in botocore
+  # or six under .aws-sam/build/, which `sam build` copies in.
+  ignore_paths:
+    - path: '.aws-sam/**'
+      reason: 'SAM build output, including dependencies vendored in by `sam build`.'
+    - path: '.pytest_cache/**'
+      reason: 'Local pytest cache.'
+    - path: '.ash/**'
+      reason: "ASH's own output directory."
+    - path: 'frontend/search-demo/node_modules/**'
+      reason: 'npm dependencies. Advisories are covered by the npm-audit scanner.'
+    - path: 'frontend/search-demo/dist/**'
+      reason: 'Vite build output.'
+    - path: 'asset-examples/**'
+      reason: '3D models supplied by the user; not distributed with this repository.'
+
+  # detect-secrets flags the fake credentials in the logger's redaction test.
+  # They are the fixture: the test asserts that a payload carrying SDMA's
+  # short-lived write credentials is redacted before it reaches CloudWatch, so
+  # the file has to contain credential-shaped values. They are deliberately
+  # unmistakable ('aSecretThatMustNotBeLogged') and are not valid anywhere.
+  # Scoped to this one file rather than to line numbers, which drift.
+  suppressions:
+    - rule_id: 'SECRET-SECRET-KEYWORD'
+      path: 'tests/test_log_utils.py'
+      reason: 'Fake credentials are the fixture for the redaction test that proves this control works.'
+
+    # --- Not applicable to how this is deployed ---
+
+    - rule_id: 'CKV_DOCKER_2'
+      path: 'backend/lambda/functions/blender-render/Dockerfile'
+      reason: 'HEALTHCHECK has no effect on a Lambda container image; Lambda manages the lifecycle and never reads it.'
+
+    - rule_id: 'CKV_AWS_116'
+      path: 'infra/cloudformation/template.yaml'
+      reason: 'A Lambda DLQ applies to asynchronous invocation. Every function here is invoked synchronously -- four by Step Functions Task states, which own the retry and failure path, and the search API through API Gateway. Failures land in AssetJobs and the execution history, not on a queue.'
+
+    # --- Deliberate trade-offs for a sample. Recorded in docs/threat-model.md. ---
+
+    - rule_id: 'CKV_AWS_117'
+      path: 'infra/cloudformation/template.yaml'
+      reason: 'Running these in a VPC would need NAT or interface endpoints for Bedrock, S3, DynamoDB and SDMA. Accepted: the functions hold no inbound surface and reach only AWS APIs.'
+
+    - rule_id: 'CKV_AWS_158'
+      path: 'infra/cloudformation/template.yaml'
+      reason: 'Log groups use the AWS-managed key rather than a customer-managed one. A CMK adds a key to manage and pay for; accepted for a sample.'
+
+    - rule_id: 'CKV_AWS_119'
+      path: 'infra/cloudformation/template.yaml'
+      reason: 'Tables use the AWS-owned key. Same trade-off as the log groups.'
+
+    - rule_id: 'CKV_AWS_173'
+      path: 'infra/cloudformation/template.yaml'
+      reason: 'Environment variables are encrypted at rest with an AWS-managed key. None of them hold a secret -- they carry table names, model ids and the SDMA endpoint.'
+
+    - rule_id: 'CKV_AWS_28'
+      path: 'infra/cloudformation/template.yaml'
+      reason: 'No point-in-time recovery. Both tables are reproducible: AssetVectors by re-running the pipeline over the assets SDMA still holds, AssetJobs is processing state with a 30-day TTL.'
+
+    - rule_id: 'CKV_AWS_18'
+      path: 'infra/cloudformation/template.yaml'
+      reason: 'No S3 access logging. It would need a second bucket to receive the logs; accepted for a sample whose bucket holds only configs and per-asset intermediates.'
+
+    - rule_id: 'CKV_AWS_120'
+      path: 'infra/cloudformation/template.yaml'
+      reason: 'API Gateway caching is off deliberately: a cached search would serve results that no longer reflect the index, and the cache is billed per hour.'
+
+    - rule_id: 'CKV_AWS_115'
+      path: 'infra/cloudformation/template.yaml'
+      reason: 'blender-render deliberately has no reserved concurrency; the other four functions do. Its concurrency is set by how many assets are being processed at once, which is unbounded by design. Measured: a 140-asset upload with a limit of 100 produced 2599 throttles and failed 8 pipelines when the retry ran out, where the same upload with no limit had zero failures.'
+
+    - rule_id: 'CKV_DOCKER_3'
+      path: 'backend/lambda/functions/blender-render/Dockerfile'
+      reason: 'No USER instruction. The AWS Lambda base image runs the runtime interface client as root and Lambda isolates each execution environment; overriding it is untested here. A genuine hardening opportunity rather than a mitigated risk.'
+
+scanners:
+  # global_settings.ignore_paths alone did not keep bandit out of .aws-sam, so
+  # the paths are repeated here in the option bandit itself reads.
+  bandit:
+    options:
+      excluded_paths:
+        - path: '.aws-sam/**'
+          reason: 'SAM build output; vendored botocore and six are not this project.'
+        - path: '.pytest_cache/**'
+          reason: 'Local pytest cache.'
+
+  # checkov needs no path exclusions: every one of its findings was in this
+  # repository's own template, Dockerfile and api-spec, none in build output.
+  # Its `skip_path` is also matched as a *regular expression* despite taking the
+  # same {path, reason} shape as ignore_paths, so a glob like '.aws-sam/**'
+  # crashes it with `re.PatternError: multiple repeat` -- and the scanner then
+  # reports ERROR with zero findings, which reads like an improvement unless the
+  # per-scanner Result column is checked.

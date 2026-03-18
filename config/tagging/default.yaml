@@ -1,0 +1,149 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+# AI Tagging Configuration - User Customizable Parameters
+version: "1.0"
+
+# ============================================================================
+# (A) Filter Attributes - Metadata for filtering search results
+# ============================================================================
+# Values MUST come from these lists so search filters match reliably.
+# These attributes become INLINE_FILTER entries on the DynamoDB vector index.
+filter_attributes:
+  # Category and subcategory definitions
+  categories:
+    Furniture:
+      description: "Seating, tables, storage, and other furniture"
+      subcategories:
+        - Chair
+        - Stool
+        - Bench
+        - Sofa
+        - Bed
+        - Table
+        - Desk
+        - Bookcase
+        - Cabinet
+
+    Kitchen:
+      description: "Kitchen appliances, cabinets, and fixtures"
+      subcategories:
+        - Appliance
+        - Cabinet
+        - Fixture
+
+    Bathroom:
+      description: "Bathroom fixtures and furniture"
+      subcategories:
+        - Fixture
+        - Cabinet
+
+    Laundry:
+      description: "Laundry appliances"
+      subcategories:
+        - Appliance
+
+    Lighting:
+      description: "Light fixtures and fans"
+      subcategories:
+        - Floor Lamp
+        - Table Lamp
+        - Ceiling Lamp
+        - Wall Lamp
+        - Fan
+
+    Electronics:
+      description: "Electronic devices"
+      subcategories:
+        - Computer
+        - Television
+        - Audio
+
+    Decor:
+      description: "Decorative items and accessories"
+      subcategories:
+        - Plant
+        - Pillow
+        - Rug
+        - Coat Rack
+        - Book
+        - Toy
+
+    Architecture:
+      description: "Structural elements"
+      subcategories:
+        - Wall
+        - Door
+        - Floor
+        - Stairs
+
+    Storage:
+      description: "Storage containers"
+      subcategories:
+        - Box
+        - Trashcan
+
+  # Style options for classification
+  styles:
+    - Realistic
+    - Stylized
+    - LowPoly
+    - Modern
+    - Traditional
+    - Minimalist
+    - Industrial
+    - Scandinavian
+
+  # Material options
+  materials:
+    - Wood
+    - Metal
+    - Plastic
+    - Fabric
+    - Leather
+    - Glass
+    - Stone
+    - Ceramic
+    - Porcelain
+
+  # Color options
+  colors:
+    - Red
+    - Orange
+    - Yellow
+    - Green
+    - Blue
+    - Purple
+    - Pink
+    - Brown
+    - Black
+    - White
+    - Gray
+    - Beige
+    - Cream
+
+  # Size category thresholds (max dimension in meters)
+  size_thresholds:
+    tiny: 0.3
+    small: 1.0
+    medium: 2.0
+    large: 5.0
+
+  # Fallback values when AI output doesn't match any option
+  fallbacks:
+    category: Furniture
+    subcategory: Cabinet
+    style: Realistic
+
+# ============================================================================
+# (B) Embedding Hints - Controls richness of generated content for semantic search
+# ============================================================================
+embedding_hints:
+  tag_generation:
+    max_tags: 12              # Maximum number of tags to generate
+    include_synonyms: true    # Include synonym terms for better search
+    include_use_cases: true   # Include usage context tags
+
+  description_generation:
+    max_length: 400                    # Maximum description length
+    include_orientation: true          # Describe object orientation
+    include_functional_context: true   # Describe how the object is used
